@@ -16,20 +16,26 @@ set -euo pipefail
 
 GH_HOST="${GH_HOST:-github.com}"
 
-usage() {
+usage_full() {
     echo "Usage: gh-wt-clone [--host <hostname>] <owner/repo> [<target-dir>]" >&2
-    exit 1
+    exit 0
 }
 
-while [[ $# -gt 0 && "$1" == --* ]]; do
+usage_brief() {
+    echo "Usage: gh-wt-clone [--host <hostname>] <owner/repo> [<target-dir>]" >&2
+    exit 0
+}
+
+while [[ $# -gt 0 && "$1" == -* ]]; do
     case "$1" in
-        --host) GH_HOST="$2"; shift 2 ;;
-        --help) usage ;;
-        *) echo "Unknown option: $1" >&2; usage ;;
+        --host)  GH_HOST="$2"; shift 2 ;;
+        --help)  usage_full ;;
+        -h | -\?) usage_brief ;;
+        *) echo "Unknown option: $1" >&2; usage_brief ;;
     esac
 done
 
-[[ $# -lt 1 ]] && usage
+[[ $# -lt 1 ]] && usage_brief
 
 _repo="$1"
 _repo_name=$(basename "${_repo}")
