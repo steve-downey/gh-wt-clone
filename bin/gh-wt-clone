@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# gh-wt-clone: Clone a GitHub/GHE repo as a bare repo with proper worktree support.
+#
+# Usage: gh-wt-clone [--host <hostname>] <owner/repo> [<target-dir>]
+#
+# Creates:
+#   <target-dir>/<reponame>.git/     bare repo with correct fetch refspecs
+#   <target-dir>/<default-branch>/   linked worktree for the default branch
+#
+# For forks, also wires up an 'upstream' remote pointing to the parent repo.
+# All remote branches get local tracking branches so 'git pull' works in worktrees.
+#
+# GH_HOST env var is respected if --host is not given.
+
+set -euo pipefail
+
+GH_HOST="${GH_HOST:-github.com}"
+
+usage() {
+    echo "Usage: gh-wt-clone [--host <hostname>] <owner/repo> [<target-dir>]" >&2
+    exit 1
+}
+
+while [[ $# -gt 0 && "$1" == --* ]]; do
+    case "$1" in
+        --host) GH_HOST="$2"; shift 2 ;;
+        --help) usage ;;
+        *) echo "Unknown option: $1" >&2; usage ;;
+    esac
+done
+
+[[ $# -lt 1 ]] && usage
+
+REPO="$1"
+REPO_NAME=$(basename "$REPO")
+
+# Default target: mirror the gh layout (owner/reponame/)
+DEFAULT_TARGET=$(dirname "$REPO")
+TARGET_DIR="${2:-$DEFAULT_TARGET}"
+BARE_DIR="$TARGET_DIR/$REPO_NAME.git"
+
+export GH_HOST
+
+# Fetch all relevant repo metadata in a single API call
+REPO_JSON=$(gh repo view "$REPO" --json isFork,defaultBranchRef,sshUrl,parent)
+IS_FORK=$(printf '%s' "$REPO_JSON" | jq -r '.isFork')
+DEFAULT_BRANCH=$(printf '%s' "$REPO_JSON" | jq -r '.defaultBranchRef.name')
+CLONE_URL=$(printf '%s' "$REPO_JSON" | jq -r '.sshUrl')
+
+mkdir -p "$TARGET_DIR"
+
+echo "Cloning $REPO -> $BARE_DIR"
+git clone --bare "$CLONE_URL" "$BARE_DIR"
+
+# git clone --bare sets fetch refspec to refs/heads/* -> refs/heads/* (no remote tracking refs).
+# Change it so subsequent fetches populate refs/remotes/origin/* instead, matching normal clone behavior.
+git -C "$BARE_DIR" config remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"
+
+# For forks, add the parent as 'upstream' with the same corrected refspec.
+if [[ "$IS_FORK" == "true" ]]; then
+    PARENT_OWNER=$(printf '%s' "$REPO_JSON" | jq -r '.parent.owner.login')
+    PARENT_NAME=$(printf '%s' "$REPO_JSON" | jq -r '.parent.name')
+    # Construct SSH URL from host/owner/name rather than relying on parent.sshUrl
+    # (not always present in the JSON payload across different GHE versions).
+    UPSTREAM_URL="git@${GH_HOST}:${PARENT_OWNER}/${PARENT_NAME}.git"
+    echo "Fork: adding upstream $UPSTREAM_URL"
+    git -C "$BARE_DIR" remote add upstream "$UPSTREAM_URL"
+    git -C "$BARE_DIR" config remote.upstream.fetch "+refs/heads/*:refs/remotes/upstream/*"
+fi
+
+# Fetch everything now that refspecs are correct.
+git -C "$BARE_DIR" fetch --all --tags
+
+# The initial bare clone created refs/heads/* from the remote, but without tracking info.
+# Set each one to track its origin counterpart so 'git pull' works inside worktrees.
+git -C "$BARE_DIR" for-each-ref --format='%(refname:short)' 'refs/remotes/origin/' |
+    grep -v '^origin/HEAD$' |
+    while IFS= read -r remote_ref; do
+        local_branch="${remote_ref#origin/}"
+        git -C "$BARE_DIR" branch --set-upstream-to="$remote_ref" "$local_branch" 2>/dev/null ||
+        git -C "$BARE_DIR" branch --track "$local_branch" "$remote_ref" 2>/dev/null || true
+    done
+
+# Add linked worktree for the default branch.
+echo "Adding worktree: $TARGET_DIR/$DEFAULT_BRANCH"
+git -C "$BARE_DIR" worktree add "../$DEFAULT_BRANCH" "$DEFAULT_BRANCH"
+
+echo "Done."
+echo "  bare repo : $BARE_DIR"
+echo "  worktree  : $TARGET_DIR/$DEFAULT_BRANCH"
+[[ "$IS_FORK" == "true" ]] && echo "  upstream  : $UPSTREAM_URL"
