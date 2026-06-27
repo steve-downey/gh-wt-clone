@@ -28,14 +28,17 @@ usage_brief() {
 
 while [[ $# -gt 0 && "$1" == -* ]]; do
     case "$1" in
-        --host)  GH_HOST="$2"; shift 2 ;;
-        --help)  usage_full ;;
+        --host)   GH_HOST="$2"; shift 2 ;;
+        --help)   usage_full ;;
         -h | -\?) usage_brief ;;
-        *) echo "Unknown option: $1" >&2; usage_brief ;;
+        *) echo "gh-wt-clone: unknown option: $1" >&2; exit 1 ;;
     esac
 done
 
-[[ $# -lt 1 ]] && usage_brief
+if [[ $# -lt 1 ]]; then
+    echo "gh-wt-clone: missing <owner/repo> argument" >&2
+    exit 1
+fi
 
 _repo="$1"
 _repo_name=$(basename "${_repo}")
