@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # gh-wt-clone: Clone a GitHub/GHE repo as a bare repo with proper worktree support.
 #
-# Usage: gh-wt-clone [--host <hostname>] <owner/repo> [<target-dir>]
+# Usage: gh-wt-clone [--host <hostname>] [--org] <owner/repo> [<target-dir>]
+#
+# By default, clones into <target-dir>/<reponame>.git (target-dir defaults to '.').
+# With --org, mirrors the owner/repo layout: <owner>/<reponame>/<reponame>.git
 #
 # Creates:
 #   <target-dir>/<reponame>.git/     bare repo with correct fetch refspecs
@@ -15,20 +18,34 @@
 set -euo pipefail
 
 GH_HOST="${GH_HOST:-github.com}"
+_use_org_layout=false
 
 usage_full() {
-    echo "Usage: gh-wt-clone [--host <hostname>] <owner/repo> [<target-dir>]" >&2
+    cat >&2 <<'EOF'
+Usage: gh-wt-clone [--host <hostname>] [--org] <owner/repo> [<target-dir>]
+
+Options:
+  --host <hostname>  GitHub host (default: $GH_HOST or github.com)
+  --org              Mirror owner/repo layout: clone into <owner>/<repo>/<repo>.git
+  --help             Show this help and exit
+  -h, -?             Show brief usage and exit
+
+By default, clones <reponame>.git and the default-branch worktree directly into
+<target-dir> (default: current directory).  Use --org when bulk-mirroring an
+organisation so each repo lives under its own subdirectory.
+EOF
     exit 0
 }
 
 usage_brief() {
-    echo "Usage: gh-wt-clone [--host <hostname>] <owner/repo> [<target-dir>]" >&2
+    echo "Usage: gh-wt-clone [--host <hostname>] [--org] <owner/repo> [<target-dir>]" >&2
     exit 0
 }
 
 while [[ $# -gt 0 && "$1" == -* ]]; do
     case "$1" in
         --host)   GH_HOST="$2"; shift 2 ;;
+        --org)    _use_org_layout=true ;;
         --help)   usage_full ;;
         -h | -\?) usage_brief ;;
         *) echo "gh-wt-clone: unknown option: $1" >&2; exit 1 ;;
@@ -43,9 +60,12 @@ fi
 _repo="$1"
 _repo_name=$(basename "${_repo}")
 
-# Default target: mirror the gh layout (owner/reponame/)
-_default_target=$(dirname "${_repo}")
-_target_dir="${2:-${_default_target}}"
+# --org nests under owner/reponame/; default drops into target-dir directly.
+if [[ "${_use_org_layout}" == "true" ]]; then
+    _target_dir="${2:-${_repo}}"
+else
+    _target_dir="${2:-.}"
+fi
 _bare_dir="${_target_dir}/${_repo_name}.git"
 
 export GH_HOST
