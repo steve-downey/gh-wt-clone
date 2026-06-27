@@ -31,61 +31,61 @@ done
 
 [[ $# -lt 1 ]] && usage
 
-REPO="$1"
-REPO_NAME=$(basename "${REPO}")
+_repo="$1"
+_repo_name=$(basename "${_repo}")
 
 # Default target: mirror the gh layout (owner/reponame/)
-DEFAULT_TARGET=$(dirname "${REPO}")
-TARGET_DIR="${2:-${DEFAULT_TARGET}}"
-BARE_DIR="${TARGET_DIR}/${REPO_NAME}.git"
+_default_target=$(dirname "${_repo}")
+_target_dir="${2:-${_default_target}}"
+_bare_dir="${_target_dir}/${_repo_name}.git"
 
 export GH_HOST
 
 # Fetch all relevant repo metadata in a single API call
-REPO_JSON=$(gh repo view "${REPO}" --json isFork,defaultBranchRef,sshUrl,parent)
-IS_FORK=$(printf '%s' "${REPO_JSON}" | jq -r '.isFork')
-DEFAULT_BRANCH=$(printf '%s' "${REPO_JSON}" | jq -r '.defaultBranchRef.name')
-CLONE_URL=$(printf '%s' "${REPO_JSON}" | jq -r '.sshUrl')
+_repo_json=$(gh repo view "${_repo}" --json isFork,defaultBranchRef,sshUrl,parent)
+_is_fork=$(printf '%s' "${_repo_json}" | jq -r '.isFork')
+_default_branch=$(printf '%s' "${_repo_json}" | jq -r '.defaultBranchRef.name')
+_clone_url=$(printf '%s' "${_repo_json}" | jq -r '.sshUrl')
 
-mkdir -p "${TARGET_DIR}"
+mkdir -p "${_target_dir}"
 
-echo "Cloning ${REPO} -> ${BARE_DIR}"
-git clone --bare "${CLONE_URL}" "${BARE_DIR}"
+echo "Cloning ${_repo} -> ${_bare_dir}"
+git clone --bare "${_clone_url}" "${_bare_dir}"
 
 # git clone --bare sets fetch refspec to refs/heads/* -> refs/heads/* (no remote tracking refs).
 # Change it so subsequent fetches populate refs/remotes/origin/* instead, matching normal clone behavior.
-git -C "${BARE_DIR}" config remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"
+git -C "${_bare_dir}" config remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"
 
 # For forks, add the parent as 'upstream' with the same corrected refspec.
-if [[ "${IS_FORK}" == "true" ]]; then
-    PARENT_OWNER=$(printf '%s' "${REPO_JSON}" | jq -r '.parent.owner.login')
-    PARENT_NAME=$(printf '%s' "${REPO_JSON}" | jq -r '.parent.name')
+if [[ "${_is_fork}" == "true" ]]; then
+    _parent_owner=$(printf '%s' "${_repo_json}" | jq -r '.parent.owner.login')
+    _parent_name=$(printf '%s' "${_repo_json}" | jq -r '.parent.name')
     # Construct SSH URL from host/owner/name rather than relying on parent.sshUrl
     # (not always present in the JSON payload across different GHE versions).
-    UPSTREAM_URL="git@${GH_HOST}:${PARENT_OWNER}/${PARENT_NAME}.git"
-    echo "Fork: adding upstream ${UPSTREAM_URL}"
-    git -C "${BARE_DIR}" remote add upstream "${UPSTREAM_URL}"
-    git -C "${BARE_DIR}" config remote.upstream.fetch "+refs/heads/*:refs/remotes/upstream/*"
+    _upstream_url="git@${GH_HOST}:${_parent_owner}/${_parent_name}.git"
+    echo "Fork: adding upstream ${_upstream_url}"
+    git -C "${_bare_dir}" remote add upstream "${_upstream_url}"
+    git -C "${_bare_dir}" config remote.upstream.fetch "+refs/heads/*:refs/remotes/upstream/*"
 fi
 
 # Fetch everything now that refspecs are correct.
-git -C "${BARE_DIR}" fetch --all --tags
+git -C "${_bare_dir}" fetch --all --tags
 
 # The initial bare clone created refs/heads/* from the remote, but without tracking info.
 # Set each one to track its origin counterpart so 'git pull' works inside worktrees.
-git -C "${BARE_DIR}" for-each-ref --format='%(refname:short)' 'refs/remotes/origin/' |
+git -C "${_bare_dir}" for-each-ref --format='%(refname:short)' 'refs/remotes/origin/' |
     grep -v '^origin/HEAD$' |
-    while IFS= read -r remote_ref; do
-        local_branch="${remote_ref#origin/}"
-        git -C "${BARE_DIR}" branch --set-upstream-to="${remote_ref}" "${local_branch}" 2>/dev/null ||
-        git -C "${BARE_DIR}" branch --track "${local_branch}" "${remote_ref}" 2>/dev/null || true
+    while IFS= read -r _remote_ref; do
+        _local_branch="${_remote_ref#origin/}"
+        git -C "${_bare_dir}" branch --set-upstream-to="${_remote_ref}" "${_local_branch}" 2>/dev/null ||
+        git -C "${_bare_dir}" branch --track "${_local_branch}" "${_remote_ref}" 2>/dev/null || true
     done
 
 # Add linked worktree for the default branch.
-echo "Adding worktree: ${TARGET_DIR}/${DEFAULT_BRANCH}"
-git -C "${BARE_DIR}" worktree add "../${DEFAULT_BRANCH}" "${DEFAULT_BRANCH}"
+echo "Adding worktree: ${_target_dir}/${_default_branch}"
+git -C "${_bare_dir}" worktree add "../${_default_branch}" "${_default_branch}"
 
 echo "Done."
-echo "  bare repo : ${BARE_DIR}"
-echo "  worktree  : ${TARGET_DIR}/${DEFAULT_BRANCH}"
-[[ "${IS_FORK}" == "true" ]] && echo "  upstream  : ${UPSTREAM_URL}"
+echo "  bare repo : ${_bare_dir}"
+echo "  worktree  : ${_target_dir}/${_default_branch}"
+[[ "${_is_fork}" == "true" ]] && echo "  upstream  : ${_upstream_url}"
