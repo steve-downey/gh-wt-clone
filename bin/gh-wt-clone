@@ -102,12 +102,26 @@ git -C "${_bare_dir}" fetch --all --tags
 
 # The initial bare clone created refs/heads/* from the remote, but without tracking info.
 # Set each one to track its origin counterpart so 'git pull' works inside worktrees.
-git -C "${_bare_dir}" for-each-ref --format='%(refname:short)' 'refs/remotes/origin/' |
-    grep -v '^origin/HEAD$' |
-    while IFS= read -r _remote_ref; do
-        _local_branch="${_remote_ref#origin/}"
-        git -C "${_bare_dir}" branch --set-upstream-to="${_remote_ref}" "${_local_branch}" 2>/dev/null ||
-        git -C "${_bare_dir}" branch --track "${_local_branch}" "${_remote_ref}" 2>/dev/null || true
+#
+# Iterate over FULL refnames -- never %(refname:short).  ':short' emits the
+# shortest *unambiguous* form, so refs/remotes/origin/HEAD prints as a bare
+# "origin" whenever no refs/heads/origin exists -- which is precisely the state
+# of a freshly cloned repo.  A filter written against "origin/HEAD" therefore
+# never matches, ${_ref#origin/} leaves "origin" untouched, and the loop below
+# creates a junk local branch literally named "origin" tracking origin/HEAD.
+#
+# The bug is self-masking, which is why it kept coming back: once that branch
+# exists, "origin" is ambiguous, ':short' starts printing "origin/HEAD", and a
+# re-run looks clean.  Deleting the junk branch is what re-arms the trap for the
+# next clone.
+git -C "${_bare_dir}" for-each-ref --format='%(refname)' 'refs/remotes/origin/' |
+    grep -v '^refs/remotes/origin/HEAD$' |
+    while IFS= read -r _full_ref; do
+        _local_branch="${_full_ref#refs/remotes/origin/}"
+        # Belt and braces: never create a branch named for the remote itself.
+        [[ -z "${_local_branch}" || "${_local_branch}" == "HEAD" ]] && continue
+        git -C "${_bare_dir}" branch --set-upstream-to="${_full_ref}" "${_local_branch}" 2>/dev/null ||
+        git -C "${_bare_dir}" branch --track "${_local_branch}" "${_full_ref}" 2>/dev/null || true
     done
 
 # Add linked worktree for the default branch.
