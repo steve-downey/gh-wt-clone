@@ -45,7 +45,7 @@ usage_brief() {
 while [[ $# -gt 0 && "$1" == -* ]]; do
     case "$1" in
         --host)   GH_HOST="$2"; shift 2 ;;
-        --org)    _use_org_layout=true ;;
+        --org)    _use_org_layout=true; shift ;;
         --help)   usage_full ;;
         -h | -\?) usage_brief ;;
         *) echo "gh-wt-clone: unknown option: $1" >&2; exit 1 ;;
