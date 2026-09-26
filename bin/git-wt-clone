@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# git-wt-clone: Clone any git repo as a bare repo with proper worktree support.
+#
+# Usage: git-wt-clone [--host <hostname>] [--org] [--upstream <url>]
+#                     <url | owner/repo> [<target-dir>]
+#
+# <target-dir> defaults to '.' and must already exist.  Creates:
+#   <target-dir>/<reponame>/<reponame>.git/     bare repo with correct fetch refspecs
+#   <target-dir>/<reponame>/<default-branch>/   linked worktree for the default branch
+# With --org, <owner>/ is inserted after <target-dir>.
+#
+# The default branch is whatever the remote's HEAD points at.
+# All remote branches get local tracking branches so 'git pull' works in worktrees.
+#
+# An owner/repo shorthand expands to https://<host>/<owner>/<repo>.git
+# (host defaults to codeberg.org).
+
+set -euo pipefail
+
+_host="codeberg.org"
+_use_org_layout=false
+_upstream_url=""
+
+usage_full() {
+    cat >&2 <<'EOF'
+Usage: git-wt-clone [--host <hostname>] [--org] [--upstream <url>]
+                    <url | owner/repo> [<target-dir>]
+
+Options:
+  --host <hostname>  Host for owner/repo shorthand (default: codeberg.org)
+  --org              Insert the owner: clone into <target-dir>/<owner>/<repo>/
+  --upstream <url>   Also add an 'upstream' remote (e.g. the parent of a fork)
+  --help             Show this help and exit
+  -h, -?             Show brief usage and exit
+
+Clones into <target-dir>/<repo>/<repo>.git and adds a worktree for the
+default branch at <target-dir>/<repo>/<default-branch>.  <target-dir>
+defaults to the current directory and must already exist.
+
+<url> may be any URL git accepts (https://, ssh://, git@host:owner/repo, or a
+local path).  owner/repo is shorthand for https://<host>/owner/repo.git.
+EOF
+    exit 0
+}
+
+usage_brief() {
+    echo "Usage: git-wt-clone [--host <hostname>] [--org] [--upstream <url>] <url | owner/repo> [<target-dir>]" >&2
+    exit 0
+}
+
+while [[ $# -gt 0 && "$1" == -* ]]; do
+    case "$1" in
+        --host)     _host="$2"; shift 2 ;;
+        --org)      _use_org_layout=true; shift ;;
+        --upstream) _upstream_url="$2"; shift 2 ;;
+        --help)     usage_full ;;
+        -h | -\?)   usage_brief ;;
+        *) echo "git-wt-clone: unknown option: $1" >&2; exit 1 ;;
+    esac
+done
+
+if [[ $# -lt 1 ]]; then
+    echo "git-wt-clone: missing <url | owner/repo> argument" >&2
+    exit 1
+fi
+
+_repo="$1"
+_target_dir="${2:-.}"
+
+# owner/repo contains no ':' and exactly one '/'; anything else is handed to git as-is.
+if [[ "${_repo}" == *:* || "${_repo}" == /* || "${_repo}" == .* ]]; then
+    _clone_url="${_repo}"
+elif [[ "${_repo}" =~ ^[^/]+/[^/]+$ ]]; then
+    _clone_url="https://${_host}/${_repo%.git}.git"
+else
+    echo "git-wt-clone: expected a URL or owner/repo, got: ${_repo}" >&2
+    exit 1
+fi
+
+# Last path component is the repo, the one before it the owner.  Splitting on
+# both '/' and ':' covers scp-style git@host:owner/repo as well as real URLs.
+_path="${_clone_url%/}"
+_path="${_path%.git}"
+_repo_name="${_path##*[/:]}"
+_owner="${_path%[/:]*}"
+_owner="${_owner##*[/:]}"
+
+if [[ -z "${_repo_name}" ]]; then
+    echo "git-wt-clone: cannot determine repo name from: ${_repo}" >&2
+    exit 1
+fi
+
+if [[ ! -d "${_target_dir}" ]]; then
+    echo "git-wt-clone: target directory does not exist: ${_target_dir}" >&2
+    exit 1
+fi
+
+if [[ "${_use_org_layout}" == "true" ]]; then
+    _repo_dir="${_target_dir}/${_owner}/${_repo_name}"
+else
+    _repo_dir="${_target_dir}/${_repo_name}"
+fi
+_bare_dir="${_repo_dir}/${_repo_name}.git"
+
+echo "Cloning ${_clone_url} -> ${_bare_dir}"
+git clone --bare "${_clone_url}" "${_bare_dir}"
+
+# A bare clone's HEAD mirrors the remote's HEAD, i.e. the default branch.
+_default_branch=$(git -C "${_bare_dir}" symbolic-ref --short HEAD)
+
+# git clone --bare sets fetch refspec to refs/heads/* -> refs/heads/* (no remote tracking refs).
+# Change it so subsequent fetches populate refs/remotes/origin/* instead, matching normal clone behavior.
+git -C "${_bare_dir}" config remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"
+
+if [[ -n "${_upstream_url}" ]]; then
+    echo "Adding upstream ${_upstream_url}"
+    git -C "${_bare_dir}" remote add upstream "${_upstream_url}"
+    git -C "${_bare_dir}" config remote.upstream.fetch "+refs/heads/*:refs/remotes/upstream/*"
+fi
+
+# Fetch everything now that refspecs are correct.
+git -C "${_bare_dir}" fetch --all --tags
+
+# The initial bare clone created refs/heads/* from the remote, but without tracking info.
+# Set each one to track its origin counterpart so 'git pull' works inside worktrees.
+#
+# Iterate over FULL refnames -- never %(refname:short).  ':short' emits the
+# shortest *unambiguous* form, so refs/remotes/origin/HEAD prints as a bare
+# "origin" whenever no refs/heads/origin exists -- which is precisely the state
+# of a freshly cloned repo.  A filter written against "origin/HEAD" therefore
+# never matches, ${_ref#origin/} leaves "origin" untouched, and the loop below
+# creates a junk local branch literally named "origin" tracking origin/HEAD.
+#
+# The bug is self-masking, which is why it kept coming back: once that branch
+# exists, "origin" is ambiguous, ':short' starts printing "origin/HEAD", and a
+# re-run looks clean.  Deleting the junk branch is what re-arms the trap for the
+# next clone.
+git -C "${_bare_dir}" for-each-ref --format='%(refname)' 'refs/remotes/origin/' |
+    grep -v '^refs/remotes/origin/HEAD$' |
+    while IFS= read -r _full_ref; do
+        _local_branch="${_full_ref#refs/remotes/origin/}"
+        # Belt and braces: never create a branch named for the remote itself.
+        [[ -z "${_local_branch}" || "${_local_branch}" == "HEAD" ]] && continue
+        git -C "${_bare_dir}" branch --set-upstream-to="${_full_ref}" "${_local_branch}" 2>/dev/null ||
+        git -C "${_bare_dir}" branch --track "${_local_branch}" "${_full_ref}" 2>/dev/null || true
+    done
+
+# Add linked worktree for the default branch.
+echo "Adding worktree: ${_repo_dir}/${_default_branch}"
+git -C "${_bare_dir}" worktree add "../${_default_branch}" "${_default_branch}"
+
+echo "Done."
+echo "  bare repo : ${_bare_dir}"
+echo "  worktree  : ${_repo_dir}/${_default_branch}"
+[[ -n "${_upstream_url}" ]] && echo "  upstream  : ${_upstream_url}"
+exit 0

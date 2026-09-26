@@ -1,51 +1,50 @@
 #!/usr/bin/env bash
 # gh-wt-clone: Clone a GitHub/GHE repo as a bare repo with proper worktree support.
 #
-# Usage: gh-wt-clone [--host <hostname>] [--org] <owner/repo> [<target-dir>]
+# Usage: gh-wt-clone [--host <hostname>] [--org] <owner/repo | repo | url> [<target-dir>]
 #
-# By default, clones into <target-dir>/<reponame>.git (target-dir defaults to '.').
-# With --org, mirrors the owner/repo layout: <owner>/<reponame>/<reponame>.git
+# <target-dir> defaults to '.' and must already exist.  Creates:
+#   <target-dir>/<reponame>/<reponame>.git/     bare repo with correct fetch refspecs
+#   <target-dir>/<reponame>/<default-branch>/   linked worktree for the default branch
+# With --org, <owner>/ is inserted after <target-dir>.
 #
-# Creates:
-#   <target-dir>/<reponame>.git/     bare repo with correct fetch refspecs
-#   <target-dir>/<default-branch>/   linked worktree for the default branch
-#
-# For forks, also wires up an 'upstream' remote pointing to the parent repo.
-# All remote branches get local tracking branches so 'git pull' works in worktrees.
+# Resolves the SSH clone URL (and, for forks, the parent) via 'gh', then hands
+# off to git-wt-clone, which must live alongside this script.
 #
 # GH_HOST env var is respected if --host is not given.
 
 set -euo pipefail
 
 GH_HOST="${GH_HOST:-github.com}"
-_use_org_layout=false
+_org_flag=()
 
 usage_full() {
     cat >&2 <<'EOF'
-Usage: gh-wt-clone [--host <hostname>] [--org] <owner/repo> [<target-dir>]
+Usage: gh-wt-clone [--host <hostname>] [--org] <owner/repo | repo | url> [<target-dir>]
 
 Options:
   --host <hostname>  GitHub host (default: $GH_HOST or github.com)
-  --org              Mirror owner/repo layout: clone into <owner>/<repo>/<repo>.git
+  --org              Insert the owner: clone into <target-dir>/<owner>/<repo>/
   --help             Show this help and exit
   -h, -?             Show brief usage and exit
 
-By default, clones <reponame>.git and the default-branch worktree directly into
-<target-dir> (default: current directory).  Use --org when bulk-mirroring an
-organisation so each repo lives under its own subdirectory.
+Clones into <target-dir>/<repo>/<repo>.git and adds a worktree for the
+default branch at <target-dir>/<repo>/<default-branch>.  <target-dir>
+defaults to the current directory and must already exist.  Forks also get an
+'upstream' remote pointing at the parent repo.
 EOF
     exit 0
 }
 
 usage_brief() {
-    echo "Usage: gh-wt-clone [--host <hostname>] [--org] <owner/repo> [<target-dir>]" >&2
+    echo "Usage: gh-wt-clone [--host <hostname>] [--org] <owner/repo | repo | url> [<target-dir>]" >&2
     exit 0
 }
 
 while [[ $# -gt 0 && "$1" == -* ]]; do
     case "$1" in
         --host)   GH_HOST="$2"; shift 2 ;;
-        --org)    _use_org_layout=true; shift ;;
+        --org)    _org_flag=(--org); shift ;;
         --help)   usage_full ;;
         -h | -\?) usage_brief ;;
         *) echo "gh-wt-clone: unknown option: $1" >&2; exit 1 ;;
@@ -58,77 +57,33 @@ if [[ $# -lt 1 ]]; then
 fi
 
 _repo="$1"
-_repo_name=$(basename "${_repo}")
+_target_dir="${2:-.}"
 
-# --org nests under owner/reponame/; default drops into target-dir directly.
-if [[ "${_use_org_layout}" == "true" ]]; then
-    _target_dir="${2:-${_repo}}"
-else
-    _target_dir="${2:-.}"
+# Resolve symlinks so an install that links only this script into ~/bin still
+# finds the real sibling.
+_self=$(readlink -f "${BASH_SOURCE[0]}")
+_git_wt_clone="$(dirname "${_self}")/git-wt-clone"
+
+if [[ ! -d "${_target_dir}" ]]; then
+    echo "gh-wt-clone: target directory does not exist: ${_target_dir}" >&2
+    exit 1
 fi
-_bare_dir="${_target_dir}/${_repo_name}.git"
 
 export GH_HOST
 
 # Fetch all relevant repo metadata in a single API call
-_repo_json=$(gh repo view "${_repo}" --json isFork,defaultBranchRef,sshUrl,parent)
+_repo_json=$(gh repo view "${_repo}" --json isFork,sshUrl,parent)
 _is_fork=$(printf '%s' "${_repo_json}" | jq -r '.isFork')
-_default_branch=$(printf '%s' "${_repo_json}" | jq -r '.defaultBranchRef.name')
 _clone_url=$(printf '%s' "${_repo_json}" | jq -r '.sshUrl')
 
-mkdir -p "${_target_dir}"
-
-echo "Cloning ${_repo} -> ${_bare_dir}"
-git clone --bare "${_clone_url}" "${_bare_dir}"
-
-# git clone --bare sets fetch refspec to refs/heads/* -> refs/heads/* (no remote tracking refs).
-# Change it so subsequent fetches populate refs/remotes/origin/* instead, matching normal clone behavior.
-git -C "${_bare_dir}" config remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"
-
-# For forks, add the parent as 'upstream' with the same corrected refspec.
+# For forks, add the parent as 'upstream'.
+_upstream_flag=()
 if [[ "${_is_fork}" == "true" ]]; then
     _parent_owner=$(printf '%s' "${_repo_json}" | jq -r '.parent.owner.login')
     _parent_name=$(printf '%s' "${_repo_json}" | jq -r '.parent.name')
     # Construct SSH URL from host/owner/name rather than relying on parent.sshUrl
     # (not always present in the JSON payload across different GHE versions).
-    _upstream_url="git@${GH_HOST}:${_parent_owner}/${_parent_name}.git"
-    echo "Fork: adding upstream ${_upstream_url}"
-    git -C "${_bare_dir}" remote add upstream "${_upstream_url}"
-    git -C "${_bare_dir}" config remote.upstream.fetch "+refs/heads/*:refs/remotes/upstream/*"
+    _upstream_flag=(--upstream "git@${GH_HOST}:${_parent_owner}/${_parent_name}.git")
 fi
 
-# Fetch everything now that refspecs are correct.
-git -C "${_bare_dir}" fetch --all --tags
-
-# The initial bare clone created refs/heads/* from the remote, but without tracking info.
-# Set each one to track its origin counterpart so 'git pull' works inside worktrees.
-#
-# Iterate over FULL refnames -- never %(refname:short).  ':short' emits the
-# shortest *unambiguous* form, so refs/remotes/origin/HEAD prints as a bare
-# "origin" whenever no refs/heads/origin exists -- which is precisely the state
-# of a freshly cloned repo.  A filter written against "origin/HEAD" therefore
-# never matches, ${_ref#origin/} leaves "origin" untouched, and the loop below
-# creates a junk local branch literally named "origin" tracking origin/HEAD.
-#
-# The bug is self-masking, which is why it kept coming back: once that branch
-# exists, "origin" is ambiguous, ':short' starts printing "origin/HEAD", and a
-# re-run looks clean.  Deleting the junk branch is what re-arms the trap for the
-# next clone.
-git -C "${_bare_dir}" for-each-ref --format='%(refname)' 'refs/remotes/origin/' |
-    grep -v '^refs/remotes/origin/HEAD$' |
-    while IFS= read -r _full_ref; do
-        _local_branch="${_full_ref#refs/remotes/origin/}"
-        # Belt and braces: never create a branch named for the remote itself.
-        [[ -z "${_local_branch}" || "${_local_branch}" == "HEAD" ]] && continue
-        git -C "${_bare_dir}" branch --set-upstream-to="${_full_ref}" "${_local_branch}" 2>/dev/null ||
-        git -C "${_bare_dir}" branch --track "${_local_branch}" "${_full_ref}" 2>/dev/null || true
-    done
-
-# Add linked worktree for the default branch.
-echo "Adding worktree: ${_target_dir}/${_default_branch}"
-git -C "${_bare_dir}" worktree add "../${_default_branch}" "${_default_branch}"
-
-echo "Done."
-echo "  bare repo : ${_bare_dir}"
-echo "  worktree  : ${_target_dir}/${_default_branch}"
-[[ "${_is_fork}" == "true" ]] && echo "  upstream  : ${_upstream_url}"
+exec "${_git_wt_clone}" "${_org_flag[@]}" "${_upstream_flag[@]}" "${_clone_url}" "${_target_dir}"
