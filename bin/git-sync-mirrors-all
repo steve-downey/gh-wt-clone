@@ -1,0 +1,51 @@
+#!/usr/bin/env zsh
+# git sync-mirrors-all [DIR] [sync-mirrors options]
+#
+# Run `git sync-mirrors --no-publish` in every repo under DIR (default ~/src):
+# bare repos named *.git and the .git directories of ordinary clones.  Repos
+# with fewer than two mirror remotes have nothing to sync and are not shown.
+# Each other repo is printed under its path, with the exit code when it
+# failed (a divergence, an unreachable mirror, a refused fast-forward).
+#
+# --no-publish is always passed: a sweep only moves commits that some mirror
+# already has.  Publishing local work is done repo by repo, by hand.  Further
+# options go to sync-mirrors; -n makes the whole sweep a dry run.
+#
+# Never pass --prune here: in a shared project it would delete other people's
+# merged branches.
+
+if [[ ${1:-} == (-h|--help) ]]; then
+    sed -n '2,/^$/s/^# \{0,1\}//p' "$0"
+    exit 0
+fi
+
+dir=$HOME/src
+if [[ $# -gt 0 && $1 != -* ]]; then
+    dir=$1
+    shift
+fi
+for a in "$@"; do
+    if [[ $a == --prune ]]; then
+        print -u2 "git sync-mirrors-all: --prune is not allowed in a sweep"
+        exit 2
+    fi
+done
+
+cd "$dir" || exit 1
+result=0
+for R in **/(*.git|.git)(N/); do
+    out=$(git -C "$R" sync-mirrors --no-publish "$@" 2>&1)
+    rc=$?
+    if [[ $rc -eq 0 && $out == *"nothing to sync" ]]; then
+        continue
+    fi
+    name=${R%/.git}
+    if [[ $rc -ne 0 ]]; then
+        print -r -- "== $name  (exit $rc)"
+        result=1
+    else
+        print -r -- "== $name"
+    fi
+    print -r -- "$out"
+done
+exit $result
